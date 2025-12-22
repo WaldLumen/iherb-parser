@@ -1,0 +1,7 @@
+cloudscraper
+beautifulsoup4
+colorama
+pyautogui
+pyperclip
+pillow
+pywin32
