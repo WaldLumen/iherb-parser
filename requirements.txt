@@ -1,7 +1,5 @@
-cloudscraper
-beautifulsoup4
-colorama
-pyautogui
-pyperclip
-pillow
-pywin32
+aiogram==3.1.0
+cloudscraper==1.2.69
+beautifulsoup4==4.12.2
+lxml==4.9.3
+colorama==0.4.6
