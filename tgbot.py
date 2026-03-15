@@ -5,107 +5,125 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.types.input_file import FSInputFile
 
-# ================== НАСТРОЙКИ ==================
+BOT_TOKEN = "8312766603:AAEvChLHAh9WE35hROu92Uv2yvkzqaKi5Xo"
 
-BOT_TOKEN = "8312766603:AAH2e00Ga-PxCLpaT1ef_eAG4kjl75yNEjs"
-
-# путь к python (лучше из venv)
-PYTHON_BIN = r"C:\Users\rika\Documents\code\iherb_parser\.venv\Scripts\python.exe"
-# PYTHON_BIN = "python3"  # если без venv
-
-SCRIPT_PATH = r"C:\Users\rika\Documents\code\iherb_parser\main.py"
+PYTHON_BIN = r"C:\Users\rika\Documents\iherb-parser-main\.venv\Scripts\python.exe"
+SCRIPT_PATH = r"C:\Users\rika\Documents\iherb-parser-main\main.py"
 
 DATA_DIR = Path("C:/Users/rika/Documents/iherb_parser_data")
-
-# ===============================================
-
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+user_state = {}
+parser_lock = asyncio.Lock()
 
-def find_latest_zip(folder: Path) -> Path | None:
-    folder = Path(folder)
+
+def find_latest_zip(folder: Path):
+
     zips = list(folder.glob("*.zip"))
+
     if not zips:
         return None
+
     return max(zips, key=lambda f: f.stat().st_mtime)
 
 
-
 @dp.message(Command("parse"))
-async def parse_command(message: Message):
-    args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        await message.answer("❌ Формат: /parse <URL> <КІЛЬКІСТЬ>")
+async def start_parse(message: Message):
+
+    user_state[message.from_user.id] = {"step": "url"}
+
+    await message.answer("🔗 Введіть URL категорії iHerb")
+
+
+@dp.message()
+async def dialog(message: Message):
+
+    uid = message.from_user.id
+
+    if uid not in user_state:
         return
 
-    url = args[1]
+    state = user_state[uid]
 
-    try:
-        count = int(args[2])
-        if count <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Кількість має бути додатнім числом")
+    if state["step"] == "url":
+
+        state["url"] = message.text
+        state["step"] = "count"
+
+        await message.answer("📦 Скільки товарів парсити?")
+
         return
 
-    await message.answer(f"⏳ Запускаю парсер...\n🔗 {url}\n📦 Кількість: {count}")
+    if state["step"] == "count":
 
-    # запускаем скрипт с неблокирующим stdout (-u чтобы лог был без буферизации)
-    process = await asyncio.create_subprocess_exec(
-        PYTHON_BIN, "-u",
-        SCRIPT_PATH,
-        str(count),
-        url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+        try:
+            state["count"] = int(message.text)
+        except:
+            await message.answer("❌ Введіть число")
+            return
 
-    # лог в реальном времени
-    log_buffer = []
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
+        state["step"] = "discount"
 
-        text = line.decode(errors="ignore").strip()
-        if text:
-            log_buffer.append(text)
-
-        # отправляем каждые 5 строк, чтобы не спамить
-        if len(log_buffer) >= 5:
-            await message.answer("📝 Лог:\n```\n" + "\n".join(log_buffer) + "\n```")
-            log_buffer.clear()
-
-    await process.wait()
-
-    # отправляем оставшийся лог
-    if log_buffer:
-        await message.answer("📝 Лог:\n```\n" + "\n".join(log_buffer) + "\n```")
-
-    # проверяем на ошибки
-    if process.returncode != 0:
-        stderr = await process.stderr.read()
-        await message.answer(f"❌ Помилка виконання скрипта:\n```\n{stderr.decode()}\n```")
-        return
-
-    # ======= Отправка архива =======
-    archive_path = find_latest_zip(DATA_DIR)
-    if not archive_path or not archive_path.exists():
-        await message.answer("⚠️ Архів не знайдено після парсингу")
-        return
-
-    try:
-        # ⚡ Используем FSInputFile вместо InputFile
-        file_to_send = FSInputFile(str(archive_path))
-        await message.answer_document(
-            document=file_to_send,
-            caption=f"📦 Архів готовий: {archive_path.name}"
+        await message.answer(
+            "💸 Введіть знижку %\n"
+            "0 = автоматично"
         )
-    except Exception as e:
-        await message.answer(f"⚠️ Не вдалося надіслати архів: {e}")
-    await message.answer("✅ Парсинг завершено")
+
+        return
+
+    if state["step"] == "discount":
+
+        try:
+            discount = int(message.text)
+        except:
+            await message.answer("❌ Введіть число")
+            return
+
+        url = state["url"]
+        count = state["count"]
+
+        del user_state[uid]
+
+        if parser_lock.locked():
+            await message.answer("⏳ Парсер вже працює")
+            return
+
+        async with parser_lock:
+
+            await message.answer("🚀 Запускаю парсер...")
+
+            process = await asyncio.create_subprocess_exec(
+                PYTHON_BIN,
+                "-u",
+                SCRIPT_PATH,
+                str(count),
+                url,
+                str(discount),
+                stdout=asyncio.subprocess.PIPE
+            )
+
+            while True:
+
+                line = await process.stdout.readline()
+
+                if not line:
+                    break
+
+                print(line.decode().strip())
+
+            await process.wait()
+
+            archive = find_latest_zip(DATA_DIR)
+
+            if archive:
+                await message.answer_document(
+                    FSInputFile(str(archive)),
+                    caption="📦 Архів готовий"
+                )
+
+            await message.answer("✅ Парсинг завершено")
 
 
 async def main():

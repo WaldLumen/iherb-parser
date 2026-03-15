@@ -1,79 +1,53 @@
 import sys
 import re
-import time
+import json
 import math
-import os
 import zipfile
-import shutil
+import urllib.request
 from pathlib import Path
-
 from urllib.parse import urljoin, urlparse, urlunparse
 from datetime import datetime
 
 import cloudscraper
-
 from bs4 import BeautifulSoup
 from colorama import init, Fore
 
 init(autoreset=True)
 
-# ===================== КОНСТАНТЫ =====================
-
 BASE_URL = "https://ua.iherb.com"
 VAT = 1.05
-DEFAULT_DISCOUNT = 15
 MAX_CHARS = 850
-DATA_DIR = "C:/Users/rika/Documents/iherb_parser_data"
+DATA_DIR = Path("C:/Users/rika/Documents/iherb_parser_data")
+DATA_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cookie": "iher-pref1=storeid=0&sccode=UA&lan=uk-UA&scurcode=UAH&wp=2"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-FEATURE_BLACKLIST = {"містить", "інгредієнти", "склад", "зберігати"}
-
-BLOCK_PATTERNS = [
-    r"/r/",
-    r"New-Products",
-    r"Specials",
-    r"Trial-Pricing",
-    r"21st-century",
-    r"nmn"
-]
-
 scraper = cloudscraper.create_scraper()
+USER_DISCOUNT = None
+USD_RATE = None  # загружается один раз в parse_product
 
-# ===================== УТИЛИТЫ =====================
-def pack_and_cleanup(folder_path, archive_name="archive.zip"):
-    folder = Path(folder_path).resolve()
-    archive_path = folder / archive_name
 
-    if not folder.is_dir():
-        raise ValueError("Указанный путь не является папкой")
+# ================= КУРС НБУ =================
 
-    # Создаём архив
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for item in folder.iterdir():
-            if item.name == archive_name:
-                continue
-            if item.is_file():
-                zipf.write(item, arcname=item.name)
-            else:
-                for sub in item.rglob("*"):
-                    zipf.write(sub, arcname=sub.relative_to(folder))
+def get_usd_uah_rate() -> float:
+    """Получает актуальный курс USD→UAH с API Национального банка Украины."""
+    try:
+        url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+            rate = float(data[0]["rate"])
+            print(Fore.CYAN + f"  Курс НБУ: 1 USD = {rate} UAH")
+            return rate
+    except Exception as e:
+        print(Fore.YELLOW + f"  Не вдалося отримати курс НБУ ({e}), використовую 41.0")
+        return 41.0  # fallback
 
-    # Удаляем всё кроме архива
-    for item in folder.iterdir():
-        if item.name == archive_name:
-            continue
-        if item.is_file():
-            item.unlink()
-        else:
-            shutil.rmtree(item)
 
-    print(f"Готово: создан архив {archive_path}")
-
+# ================= UTILS =================
 
 def normalize_link(link: str) -> str:
     link = urljoin(BASE_URL, link)
@@ -81,192 +55,278 @@ def normalize_link(link: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
-def parse_price(text: str) -> float | None:
+def parse_price(text: str):
+    """
+    Надёжно извлекает число из строки цены.
+    Поддерживает форматы: 1,234.56 / 1 234,56 / $12.99 / 12,99
+    """
     if not text:
         return None
-
-    text = text.replace("\xa0", "").replace(" ", "")
-    match = re.search(r"[\d.,]+", text)
-    if not match:
+    # Убираем пробелы, валютные символы и неразрывные пробелы
+    text = re.sub(r"[^\d.,]", "", text.replace("\xa0", ""))
+    if not text:
         return None
-
-    value = match.group()
-
-    if "," in value and "." in value:
-        value = value.replace(",", "")
-    else:
-        value = value.replace(",", ".")
-
+    # Есть и запятая и точка → запятая = разделитель тысяч
+    if "," in text and "." in text:
+        text = text.replace(",", "")
+    # Только запятая → определяем роль по количеству цифр после неё
+    elif "," in text:
+        parts = text.split(",")
+        if len(parts) == 2 and len(parts[1]) in (2, 3) and len(parts[0]) <= 4:
+            # Скорее всего десятичный разделитель: 12,99
+            text = text.replace(",", ".")
+        else:
+            # Разделитель тысяч: 1,234
+            text = text.replace(",", "")
     try:
-        return float(value)
+        return float(text)
     except ValueError:
         return None
 
 
-def extract_discount(soup: BeautifulSoup) -> int:
-    span = soup.select_one(".percent-off")
-    if not span:
-        return DEFAULT_DISCOUNT
+def extract_price_from_soup(soup):
+    """
+    Возвращает (raw_text, parsed_float, currency).
+    iherb UA отдаёт цены в USD — конвертация в UAH происходит снаружи.
+    """
 
-    text = span.get_text(strip=True)
-    # text -> "(Знижка 55 %)" или "(Знижка 55 %)"
+    # 1. JSON-LD — самый надёжный источник (чистое число без мусора)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            offers = data.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0]
+            raw = str(offers.get("price", ""))
+            currency = offers.get("priceCurrency", "USD")
+            val = parse_price(raw)
+            if val and val > 0:
+                return raw, val, currency
+        except Exception:
+            pass
 
-    match = re.search(r"(\d+)\s*%", text)
-    if not match:
-        return DEFAULT_DISCOUNT
+    # 2. itemprop="price" — числовой атрибут
+    for selector, attr in [
+        ("[itemprop='price']", "content"),
+        ("[itemprop='price']", "data-price"),
+        ("[data-price]", "data-price"),
+    ]:
+        el = soup.select_one(selector)
+        if el:
+            raw = el.get(attr, "").strip()
+            val = parse_price(raw)
+            if val and val > 0:
+                return raw, val, "USD"
 
-    return int(match.group(1))
+    # 3. CSS — ищем элемент с $ и разумной ценой (1–2000 USD)
+    for selector in [
+        ".price-container .price",
+        ".product-price-container .price",
+        ".our-price",
+        ".product-price .price",
+        "#price",
+        "span.price",
+        ".price",
+    ]:
+        for el in soup.select(selector):
+            text = el.get_text(strip=True)
+            # берём только если есть $ и строка не замусорена
+            if "$" in text and len(text) < 20:
+                val = parse_price(text)
+                if val and 1 < val < 2000:
+                    return text, val, "USD"
 
-    match = re.search(r"(\d{1,2})%", div.text)
-    return max(DEFAULT_DISCOUNT, int(match.group(1))) if match else DEFAULT_DISCOUNT
+    return None, None, None
 
 
-def is_valid_feature(text: str) -> bool:
-    t = text.lower()
-    return not any(word in t for word in FEATURE_BLACKLIST)
+def extract_discount(soup):
+    if USER_DISCOUNT is not None:
+        return USER_DISCOUNT
+    for selector in [".percent-off", ".discount-percent", "[data-discount]", ".sale-percent"]:
+        el = soup.select_one(selector)
+        if el:
+            raw = el.get("data-discount") or el.get_text(strip=True)
+            m = re.search(r"(\d{1,2})\s*%", raw)
+            if m:
+                return int(m.group(1))
+    return 15  # дефолт
 
-# ===================== ПАРСИНГ =====================
 
-def get_links(url: str) -> list[str]:
-    soup = BeautifulSoup(
-        scraper.get(url, headers=HEADERS, timeout=15).text,
-        "html.parser"
+# ================= PARSING =================
+
+def get_links(url):
+    r = scraper.get(url, headers=HEADERS)
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    product_div = (
+        soup.find("div", class_="products product-cells clearfix")
+        or soup.find("div", id="category-products-grid")
+        or soup.find("ul", class_="products-grid")
+        or soup.find("div", attrs={"data-context": "category"})
     )
 
-    div = soup.find("div", class_="products product-cells clearfix")
-    if not div:
-        raise RuntimeError("Список товарів не знайдено")
+    if not product_div:
+        raise RuntimeError("Не знайдено список товарів. Перевірте URL або структуру сторінки.")
 
-    links = [normalize_link(a["href"]) for a in div.find_all("a", href=True)]
-
-    result = []
-    for link in links:
-        if any(re.search(p, link) for p in BLOCK_PATTERNS):
+    links = []
+    for a in product_div.find_all("a", href=True):
+        link = normalize_link(a["href"])
+        if "/r/" in link or link == BASE_URL:
             continue
-        result.append(link)
+        if re.search(r"/pr/|/p/|\d{5,}", link):
+            links.append(link)
 
-    return list(dict.fromkeys(result))
+    return list(dict.fromkeys(links))
 
 
-def parse_summary(url: str):
-    soup = BeautifulSoup(
-        scraper.get(url, headers=HEADERS, timeout=15).text,
-        "html.parser"
-    )
+def parse_product(url):
+    global USD_RATE
+    if USD_RATE is None:
+        USD_RATE = get_usd_uah_rate()
 
-    title = soup.find("h1")
-    title = title.get_text(strip=True) if title else "Без назви"
+    r = scraper.get(url, headers=HEADERS)
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    desc_div = soup.find("div", class_="prodOverviewDetail")
-    description = desc_div.get_text(strip=True) if desc_div else "Опис відсутній"
+    # Заголовок
+    title_el = soup.select_one("h1.product-title, h1[itemprop='name'], h1")
+    title = title_el.get_text(strip=True) if title_el else "Без назви"
 
-    price_div = soup.find("div", class_="list-price")
-    price_value = parse_price(price_div.text if price_div else "")
-
+    # Цена и скидка (нужны раньше — для расчёта бюджета описания)
+    raw_text, price_usd, currency = extract_price_from_soup(soup)
     discount = extract_discount(soup)
 
-    if price_value:
-        price_value = math.ceil(price_value * (1 - discount / 100) * VAT)
+    if price_usd:
+        price_uah = price_usd * USD_RATE
+        price_after_discount = price_uah * (1 - discount / 100)  # применяем скидку
+        final_price = math.ceil(price_after_discount * VAT)  # + НДС 5%
+        print(
+            Fore.CYAN + f"  {raw_text!r} ({currency}) → {price_usd} USD × {USD_RATE:.2f} × {1 - discount / 100} × {VAT} = {final_price} грн")
+    else:
+        final_price = None
+        print(Fore.YELLOW + f"  Ціну не знайдено на {url}")
 
-    features = [
-        li.get_text(strip=True)
-        for col in soup.find_all("div", class_="col-xs-24")
-        for li in col.find_all("li")
-    ]
+    # Описание — режем пункты пока весь итоговый текст не влезает в MAX_CHARS
+    desc_ul = soup.select_one(".inner-content .item-row ul")
+    if desc_ul:
+        items = [li.get_text(strip=True) for li in desc_ul.find_all("li") if li.get_text(strip=True)]
 
-    return title, description, price_value, discount, features[:len(features)//2]
+        # Считаем сколько символов займёт шаблон без описания
+        template = (
+            f"🔥 -{discount}% Цiна {final_price} грн. *{title}*\n\n"
+            f"✏️ *Рекомендації*\n\n\n"
+            f"🔗 {url}"
+        )
+        budget = MAX_CHARS - len(template)
+
+        lines = []
+        for item in items:
+            line = f"• {item}"
+            chunk = "\n".join(lines + [line])
+            if len(chunk) > budget:
+                break
+            lines.append(line)
+
+        description = "\n".join(lines)
+    else:
+        # fallback на старые селекторы
+        desc_el = soup.select_one(
+            ".prodOverviewDetail, .product-overview, [itemprop='description'], .overview-content"
+        )
+        description = desc_el.get_text(strip=True) if desc_el else ""
+
+    # Изображение
+    img_el = (
+        soup.select_one("#iherb-product-image")
+        or soup.select_one("[itemprop='image']")
+        or soup.select_one(".product-image img")
+        or soup.select_one("img.product-photo")
+    )
+    img_url = None
+    if img_el:
+        img_url = img_el.get("src") or img_el.get("data-src")
+
+    return {
+        "title": title,
+        "description": description,
+        "price": final_price,
+        "discount": discount,
+        "img": img_url,
+    }
 
 
-def get_image(url: str, file_name: str, retries=3) -> bool:
-    for _ in range(retries):
-        try:
-            soup = BeautifulSoup(
-                scraper.get(url, headers=HEADERS, timeout=15).text,
-                "html.parser"
-            )
+# ================= FILES =================
 
-            img = soup.find("img", id="iherb-product-image")
-            if not img or not img.get("src"):
-                return False
-
-            data = scraper.get(img["src"], headers=HEADERS).content
-            with open(file_name, "wb") as f:
-                f.write(data)
-
-            return True
-        except Exception:
-            time.sleep(2)
-
-    return False
-
-
-def print_text(url: str, file: str) -> bool:
-    title, description, price, discount, items = parse_summary(url)
-
-    if price is None:
+def save_product(data, url, index):
+    if data["price"] is None:
         return False
 
-    features = [i for i in items if is_valid_feature(i)]
+    txt_path = DATA_DIR / f"{index}.txt"
+    img_path = DATA_DIR / f"{index}.jpg"
 
-    def build(features_list):
-        return (
-            f"🔥 -{discount}% Цiна {price} грн. *{title}*\n\n"
-            + "\n".join(f"✅ {i}" for i in features_list)
-            + f"\n\n✏️ *Рекомендації*\n{description}\n\n🔗 {url}"
-        )
+    text = (
+        f"🔥 -{data['discount']}% Цiна {data['price']} грн. *{data['title']}*\n\n"
+        f"✏️ *Рекомендації*\n{data['description']}\n\n"
+        f"🔗 {url}"
+    )
 
-    text = build(features)
-
-    while len(text) > MAX_CHARS and features:
-        features.pop()
-        text = build(features)
-
-    with open(file, "w", encoding="utf-8") as f:
+    with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
+
+    if data["img"]:
+        try:
+            img_data = scraper.get(data["img"]).content
+            with open(img_path, "wb") as f:
+                f.write(img_data)
+        except Exception:
+            txt_path.unlink(missing_ok=True)
+            return False
 
     return True
 
 
-# ===================== MAIN =====================
+# ================= ZIP =================
+
+def pack():
+    date = datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
+    archive = DATA_DIR / f"iherb_data_{date}.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        for f in DATA_DIR.glob("*"):
+            if f.suffix != ".zip":
+                z.write(f, f.name)
+                f.unlink()
+    print("Архів створено:", archive)
+
+
+# ================= MAIN =================
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("Використання: python script.py <COUNT> <URL>")
+    global USER_DISCOUNT
+
+    if len(sys.argv) != 4:
+        sys.exit("Використання: python main.py COUNT URL DISCOUNT")
 
     count = int(sys.argv[1])
     url = sys.argv[2]
+    discount = int(sys.argv[3])
+
+    if discount > 0:
+        USER_DISCOUNT = discount
 
     links = get_links(url)[:count]
+    print(f"Знайдено посилань: {len(links)}")
 
     for i, link in enumerate(links):
-        txt = f"{DATA_DIR}/{i}.txt"
-        img = f"{DATA_DIR}/{i}.jpg"
-
         try:
-            # если цены нет — файл не создаётся
-            if not print_text(link, txt):
-                print(f"{Fore.YELLOW}Без ціни → пропущено: {link}")
-                continue
-
-            # если фото не скачалось — удаляем текст
-            if not get_image(link, img):
-                os.remove(txt)
-                print(f"{Fore.YELLOW}Без фото → текст видалено: {link}")
-                continue
-
-            print(f"{Fore.GREEN}OK: {i}")
-
+            data = parse_product(link)
+            if save_product(data, link, i):
+                print(Fore.GREEN + f"OK {i}: {data['title']} — {data['price']} грн")
+            else:
+                print(Fore.YELLOW + f"Пропущено {link}")
         except Exception as e:
-            if os.path.exists(txt):
-                os.remove(txt)
-            if os.path.exists(img):
-                os.remove(img)
-            print(f"{Fore.RED}Помилка: {e}")
+            print(Fore.RED + f"Помилка [{link}]: {e}")
 
-    date_str = datetime.now().strftime("%m/%d/%Y, %H:%M:%S")
-    archive_name = f"iherb_data_{date_str}.zip"
+    pack()
 
-    pack_and_cleanup(DATA_DIR, archive_name)
 
 if __name__ == "__main__":
     main()
