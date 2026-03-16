@@ -7,10 +7,10 @@ from aiogram.types.input_file import FSInputFile
 
 BOT_TOKEN = "8312766603:AAEvChLHAh9WE35hROu92Uv2yvkzqaKi5Xo"
 
-PYTHON_BIN = r"C:\Users\rika\Documents\iherb-parser-main\.venv\Scripts\python.exe"
-SCRIPT_PATH = r"C:\Users\rika\Documents\iherb-parser-main\main.py"
+PYTHON_BIN = r"/Users/rika/PycharmProjects/iherb-parser/.venv/bin/python"
+SCRIPT_PATH = r"/Users/rika/PycharmProjects/iherb-parser/main.py"
 
-DATA_DIR = Path("C:/Users/rika/Documents/iherb_parser_data")
+DATA_DIR = Path("/Users/rika/Documents/iherb_parse_data")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()

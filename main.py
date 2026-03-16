@@ -3,6 +3,8 @@ import re
 import json
 import math
 import zipfile
+import ssl
+import certifi
 import urllib.request
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -17,7 +19,7 @@ init(autoreset=True)
 BASE_URL = "https://ua.iherb.com"
 VAT = 1.05
 MAX_CHARS = 850
-DATA_DIR = Path("C:/Users/rika/Documents/iherb_parser_data")
+DATA_DIR = Path("/Users/rika/Documents/iherb_parse_data")
 DATA_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
@@ -37,14 +39,15 @@ def get_usd_uah_rate() -> float:
     """Получает актуальный курс USD→UAH с API Национального банка Украины."""
     try:
         url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(url, timeout=10, context=ctx) as resp:
             data = json.loads(resp.read())
             rate = float(data[0]["rate"])
             print(Fore.CYAN + f"  Курс НБУ: 1 USD = {rate} UAH")
             return rate
     except Exception as e:
         print(Fore.YELLOW + f"  Не вдалося отримати курс НБУ ({e}), використовую 41.0")
-        return 41.0  # fallback
+        return 41.0
 
 
 # ================= UTILS =================
