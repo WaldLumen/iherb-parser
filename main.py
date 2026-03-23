@@ -23,31 +23,17 @@ DATA_DIR = Path("/Users/rika/Documents/iherb_parse_data")
 DATA_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36',
+    'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Cookie': 'iher-pref1=storeid=0&sccode=UA&lan=uk-UA&scurcode=UAH&wp=2; '
+              'ih-preference=store=0; '
+              'ihr-lac=rturl%3Dhttp%3A%2F%2Fcatalog.app.iherb.com%2Fcatalog%2FcurrentUser'
 }
 
 scraper = cloudscraper.create_scraper()
 USER_DISCOUNT = None
 USD_RATE = None  # загружается один раз в parse_product
-
-
-# ================= КУРС НБУ =================
-
-def get_usd_uah_rate() -> float:
-    """Получает актуальный курс USD→UAH с API Национального банка Украины."""
-    try:
-        url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        with urllib.request.urlopen(url, timeout=10, context=ctx) as resp:
-            data = json.loads(resp.read())
-            rate = float(data[0]["rate"])
-            print(Fore.CYAN + f"  Курс НБУ: 1 USD = {rate} UAH")
-            return rate
-    except Exception as e:
-        print(Fore.YELLOW + f"  Не вдалося отримати курс НБУ ({e}), використовую 41.0")
-        return 41.0
 
 
 # ================= UTILS =================
@@ -183,10 +169,6 @@ def get_links(url):
 
 
 def parse_product(url):
-    global USD_RATE
-    if USD_RATE is None:
-        USD_RATE = get_usd_uah_rate()
-
     r = scraper.get(url, headers=HEADERS)
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -199,11 +181,11 @@ def parse_product(url):
     discount = extract_discount(soup)
 
     if price_usd:
-        price_uah = price_usd * USD_RATE
+        price_uah = price_usd
         price_after_discount = price_uah * (1 - discount / 100)  # применяем скидку
         final_price = math.ceil(price_after_discount * VAT)  # + НДС 5%
         print(
-            Fore.CYAN + f"  {raw_text!r} ({currency}) → {price_usd} USD × {USD_RATE:.2f} × {1 - discount / 100} × {VAT} = {final_price} грн")
+            Fore.CYAN + f"  {raw_text!r} ({currency}) → {price_usd} UAH  × {1 - discount / 100} × {VAT} = {final_price} грн")
     else:
         final_price = None
         print(Fore.YELLOW + f"  Ціну не знайдено на {url}")
